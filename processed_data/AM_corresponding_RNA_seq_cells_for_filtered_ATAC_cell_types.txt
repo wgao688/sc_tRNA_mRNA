@@ -1,0 +1,37 @@
+ATAC	RNA
+Bone_Marrow-Hematopoietic progenitors	Bone_Marrow-hematopoietic precursor cell
+Bone_Marrow-Erythroblasts	Bone_Marrow-hematopoietic precursor cell
+Bone_Marrow-Monocytes	Bone_Marrow-monocyte
+Cerebellum-Inhibitory neurons	Brain-neuron
+Cerebellum-Cerebellar granule cells	Brain-neuron
+Heart-Endothelial II cells	Heart-endothelial cell
+Heart-Cardiomyocytes	Heart-cardiac muscle cell
+Kidney-Proximal tubule	Kidney-epithelial cell of proximal tubule
+Kidney-Proximal tubule S3	Kidney-epithelial cell of proximal tubule
+Kidney-DCT/CD	Kidney-kidney collecting duct epithelial cell
+Kidney-Loop of henle	NA
+Intestine-Enterocytes	Intestine-enterocyte of epithelium of large intestine
+Liver-Hepatocytes	Liver-hepatocyte
+Lung-T cells	Lung-T cell
+Lung-B cells	Lung-B cell
+Lung-Dendritic cells	NA
+Lung-Alveolar macrophages	Lung-monocyte
+Lung-Type I pneumocytes	NA
+Lung-Endothelial II cells	Lung-lung endothelial cell
+Prefrontal_Cortex-Inhibitory neurons	Brain-neuron
+Prefrontal_Cortex-SOM+ Interneurons	Brain-neuron
+Prefrontal_Cortex-Ex. neurons SCPN	Brain-neuron
+Prefrontal_Cortex-Ex. neurons CPN	Brain-neuron
+Prefrontal_Cortex-Ex. neurons CThPN	Brain-neuron
+Spleen-T cells	Spleen-T cell
+Spleen-B cells	Spleen-B cell
+Spleen-Dendritic cells	NA
+Testes-Sperm	NA
+Thymus-T cells	Thymus-immature T cell
+Brain-Inhibitory neurons	Brain-neuron
+Brain-Astrocytes	Brain-astrocyte
+Brain-Oligodendrocytes	Brain-oligodendrocyte
+Brain-Ex. neurons SCPN	Brain-neuron
+Brain-Ex. neurons CPN	Brain-neuron
+Brain-Ex. neurons CThPN	Brain-neuron
+Brain-Cerebellar granule cells	Brain-neuron

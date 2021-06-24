@@ -1,0 +1,745 @@
+---
+title: "FH (AM) single-cell mRNA-tRNA analysis"
+---
+
+Runtime (excluding parts indicated as optional): 5 minutes on 8 GB RAM macOS Catalina version 10.15.17
+
+Description:
+
+This R notebook runs the analysis of scRNA-seq and scATAC-seq datasets from the fetal human (FH) atlases. This script uses already processed data -- data from individual cells has been pooled to the cell type level (per the annotations provided by the atlases). 
+
+This script does the following:
+(1) Analysis of mRNA gene expression across cell types
+(2) Analysis of codon usage across cell types
+(3) Analysis of AA demand across cell types
+(4) Analysis of cell type outliers in codon usage / AA demand 
+(5) Analysis of tRNA gene "expression" (accessibility) across cell types
+(6) Analysis of anticodon usage across cell types
+(7) Analysis of AA supply across cell types
+(8) Translation efficiency analysis
+
+# Load libraries
+```{r}
+library(Biostrings)
+library(dendsort)
+library(DESeq2)
+library(ggrepel)
+library(pheatmap)
+library(tidyverse)
+library(viridis)
+# used to rearrange dendrogram in heatmap: https://slowkow.com/notes/pheatmap-tutorial/
+sort_hclust <- function(...) as.hclust(dendsort(as.dendrogram(...)))
+```
+
+# Load general variables
+```{r}
+# directory of current script
+script_directory <- dirname(rstudioapi::getSourceEditorContext()$path)
+# directory where the processed data used in this script lies (it should be in a subdirectory called "processed_data" relative to this R script)
+processed_data_directory <- paste0(script_directory, "/processed_data/")
+
+# 61 sense codons for 20 classical AAs
+sense_codons <- c("AAA", "AAC", "AAG", "AAT", "ACA", "ACC", "ACG", "ACT", "AGA","AGC","AGG","AGT","ATA","ATC","ATG","ATT", "CAA", "CAC", "CAG", "CAT", "CCA", "CCC", "CCG", "CCT", "CGA", "CGC", "CGG", "CGT", "CTA", "CTC", "CTG", "CTT", "GAA", "GAC", "GAG", "GAT", "GCA", "GCC", "GCG", "GCT", "GGA", "GGC", "GGG", "GGT", "GTA", "GTC", "GTG", "GTT", "TAC", "TAT", "TCA", "TCC", "TCG", "TCT", "TGC", "TGG", "TGT", "TTA", "TTC", "TTG", "TTT")
+
+# 20 classical AAs: one letter code
+amino_acids <- c("A", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y")
+
+# 20 classcial AAs: three letter code
+three_letter_amino_acids <- c("Ala", "Cys", "Asp", "Glu", "Phe", "Gly", "His", "Ile", "Lys", "Leu", "Met", "Asn", "Pro", "Gln", "Arg", "Ser", "Thr", "Val", "Trp", "Tyr")
+```
+
+# Load functions 
+
+## PCA function
+```{r}
+PCA_generator <- function(feature_by_cell_type_matrix) {
+
+  # take transpose of feature by cell matrix, which will be input for PCA
+  cell_type_by_feature_matrix <- t(feature_by_cell_type_matrix)
+  
+  # remove features with too low variances, if any
+  too_low_variance_features <- which(colVars(cell_type_by_feature_matrix) < 1E-5)
+  
+  if (length(too_low_variance_features) > 1) {
+    cell_type_by_feature_matrix <- cell_type_by_feature_matrix[ , -c(too_low_variance_features)]
+  }
+  
+  # run PCA 
+  PCA_res <- prcomp(cell_type_by_feature_matrix, scale = TRUE, center = TRUE)
+
+  #  1. Produce elbow plot and examine amount of variance explained
+  PC_variance_explained = 100 * (PCA_res$sdev ^ 2) / sum(PCA_res$sdev ^ 2)
+  
+  elbow_tibble <- tibble(
+    PC = 1:length(PCA_res$sdev),
+    variance_explained = PC_variance_explained
+  )
+  
+  elbow_plot <- ggplot(data = elbow_tibble) +
+    theme_classic() + 
+    geom_bar(mapping = aes(x = reorder(PC, -variance_explained), y = variance_explained), stat = "identity") +
+    labs(title = "Percentage of variance explained per PC", x = "PC", y = "% variance explained") +
+    theme(axis.text.x = element_text(angle = 90))
+  
+  # 2. Produce PCA plot
+  PCA_plot_tibble <- tibble(
+    tissue_type = sub("-.*", "", rownames(PCA_res$x)), 
+    cell_type = rownames(PCA_res$x),
+    PC_1 = PCA_res$x[, 1],
+    PC_2 = PCA_res$x[, 2]
+  )
+  
+  PCA_plot_tibble$tissue_type <- factor(PCA_plot_tibble$tissue_type)
+  
+  # use custom color theme for tissues
+  color_theme <- read.table(paste0(processed_data_directory, "Manuscript_color_palette.txt"), sep = "\t", header = 1, row.names = 1)
+  corresponding_colors_for_tissues <- color_theme[levels(PCA_plot_tibble$tissue_type), "color"] 
+  
+  # 3. PCA plot without labels
+  PCA_plot_without_labels <- ggplot(data = PCA_plot_tibble, mapping = aes(x = PC_1, y = PC_2, label = cell_type, color = tissue_type)) +
+    theme_classic() + 
+    geom_point() + 
+    scale_color_manual(values = corresponding_colors_for_tissues) +
+    labs(x = sprintf("PC1 (%.1f%%)", PC_variance_explained[1]), y = sprintf("PC2 (%.1f%%)", PC_variance_explained[2]))
+  
+  # PCA plot with labels (there are too many points so some labels cannot be displayed, but the 
+  # outlier labels will be present)
+  PCA_plot_with_labels <- PCA_plot_without_labels + geom_text_repel(size = 4, show.legend = FALSE)
+  
+  # output: a list with (1) elbow plot (2) PCA plot with labels (3) PCA plot without labels
+  return(list(elbow_plot, PCA_plot_without_labels, PCA_plot_with_labels))
+}
+```
+
+# DESEq2 analysis function
+```{r}
+# input should be a count matrix with rows corresponding to the features (genes, codons, etc.) and the columns corresponding to the cell type labels 
+
+DESeq2_runner <- function(input_count_matrix) {
+  
+  # columns of input matrix are the cell type labels
+  cell_type_labels <- colnames(input_count_matrix)
+  
+  # metadata for DESeq analysis
+  colData <- tibble(
+    cell_type = cell_type_labels,
+    tissue = sub("-.*", "", cell_type_labels)
+  )
+  
+  # run DESeq2
+  DESeq2_run <- DESeqDataSetFromMatrix(
+    countData = input_count_matrix,
+    colData = colData,
+    design = ~ tissue
+  )
+  
+  DESeq2_run <- DESeq(DESeq2_run)
+  
+  # perform variance stabilizing transformation and calculate Euclidean distances
+  vst <- varianceStabilizingTransformation(DESeq2_run)
+  Euc_Dists <- dist(t(assay(vst)))
+  vst_matrix <- as.matrix(assay(vst))
+
+  # sort nodes in hierarchical clustering
+  mat_cluster_names <- sort_hclust(hclust(Euc_Dists))
+  
+  # produce heatmap that has been hierarchically clustered
+  Dist_heatmap <- pheatmap(Euc_Dists, cluster_cols = mat_cluster_names, cluster_rows = mat_cluster_names, color = inferno(1000), border_color = NA, labels_col = mat_cluster_names$labels, labels_row = mat_cluster_names$labels, fontsize_row = 5, fontsize_col = 5)
+  
+  # run heatmap on variance stabilized count matrix
+  PCA_results <- PCA_generator(vst_matrix)
+  
+  # output count matrix that has been corrected with size factors to account for sequencing depth
+  size_corrected_output_matrix <- counts(DESeq2_run, normalized = TRUE)
+  
+  # output: (1) Euclidean distance heatmap, (2) PCA results, (3) size corrected count matrix
+  return(list(Dist_heatmap, PCA_results, size_corrected_output_matrix))
+}
+```
+
+# Neuron vs. other cell types differential analysis
+```{r}
+# input should be a count matrix with rows corresponding to the features (genes, codons, etc.) and the columns corresponding to the cell type labels 
+
+neuron_DESeq2_runner <- function(input_count_matrix, fc_threshold, p_val_threshold) {
+  
+  # columns of input matrix are the cell type labels
+  cell_type_labels <- colnames(input_count_matrix)
+  
+  # metadata for DESeq analysis
+  colData <- tibble(
+    cell_type = cell_type_labels,
+    tissue = sub("-.*", "", cell_type_labels)
+  )
+
+  # classify as neuronal vs. other
+  colData$class <- "other"
+  colData$class[grep("neuron", colData$cell_type)] <- "neuron"
+  colData$class[grep("ENS neurons", colData$cell_type)] <- "other" # cerebellar granule cells are neurons
+
+  neuron_DESeq2 <- DESeqDataSetFromMatrix(
+    countData = input_count_matrix,
+    colData = colData,
+    design = ~ class
+  )
+  
+  # run differential analysis
+  neuron_DESeq2 <- DESeq(neuron_DESeq2)
+  # summarize results: fold change is neuron vs. other
+  neuron_DESeq2_results <- as.data.frame(results(neuron_DESeq2, contrast=c("class", "neuron", "other")))
+
+  # summarize results in tibble (for visualizing in volcano plot)
+  neuron_results_tibble <- tibble(
+    feature = rownames(input_count_matrix),
+    log2_FC = neuron_DESeq2_results$log2FoldChange,
+    neg_log10_adjusted_p_value = -log10(neuron_DESeq2_results$padj),
+  ) 
+  
+  # plot volcano plot
+  volcano_plot <- ggplot() + 
+  theme_classic() + 
+  geom_point(data = neuron_results_tibble, 
+             mapping = aes(x = log2_FC, y = neg_log10_adjusted_p_value), color = "black", alpha = 0.5) + 
+  geom_point(data = dplyr::filter(neuron_results_tibble, abs(log2_FC) > fc_threshold, neg_log10_adjusted_p_value > -log10(p_val_threshold)), mapping = aes(x = log2_FC, y = neg_log10_adjusted_p_value), size = 3) +
+  geom_text_repel(data = dplyr::filter(neuron_results_tibble, abs(log2_FC) > fc_threshold, neg_log10_adjusted_p_value > -log10(p_val_threshold)), mapping = aes(x = log2_FC, y = neg_log10_adjusted_p_value, label = feature), size = 2) + 
+  geom_abline(slope = 0, intercept = -log10(p_val_threshold), linetype = "dotted") +
+  geom_vline(xintercept = -1 * fc_threshold, linetype = "dotted") +
+  geom_vline(xintercept = fc_threshold, linetype = "dotted") + 
+  labs(x = expression(log[2]~fold~change), y = expression(-log[10]~adjusted~p~value), title = "brain neurons vs. other cell types") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 20))
+  
+  # output: (1) neuron DESeq2 results in tibble format, (2) volcano plot
+  return(list(neuron_results_tibble, volcano_plot))
+}
+```
+
+### Part 1: Gene expression analysis (scRNA-seq) ###
+```{r fig.height = 10, fig.width = 10}
+# load dataset
+mRNA_gene_expression_per_cell_type <- readRDS(paste0(processed_data_directory, "FH_scRNA_count_matrix.rds"))
+
+scRNA_seq_cell_types <- colnames(mRNA_gene_expression_per_cell_type)
+
+# Note: This next line takes about 20 minutes to run. To avoid this, load the R object below instead
+#mRNA_gene_expression_DESeq2_results <- DESeq2_runner(mRNA_gene_expression_per_cell_type)
+#saveRDS(mRNA_gene_expression_DESeq2_results, paste0(processed_data_directory, "FH_mRNA_gene_expression_DESeq2_results.rds"))
+
+mRNA_gene_expression_DESeq2_results <- readRDS(paste0(processed_data_directory, "FH_mRNA_gene_expression_DESeq2_results.rds"))
+
+print(mRNA_gene_expression_DESeq2_results[[1]])
+print(mRNA_gene_expression_DESeq2_results[[2]])
+size_corrected_mRNA_gene_expression_per_cell_type <- mRNA_gene_expression_DESeq2_results[[3]]
+```
+
+### Part 2: Codon usage analysis (scRNA-seq) ###
+
+# Matrix multiply [codon frequency per gene] matrix by [gene expression per cell type] matrix to generate [codon usage per cell type] matrix
+```{r}
+# Load codon frequency per mRNA gene matrix
+codon_frequency_per_gene_table <- readRDS(paste0(processed_data_directory, "human_codon_usage_table.rds"))
+
+# perform analysis for only genes in common between RNA-seq count matrix and codon frequency per mRNA gene matrix
+mRNAs_in_common <- intersect(colnames(codon_frequency_per_gene_table), rownames(mRNA_gene_expression_per_cell_type))
+
+filtered_mRNA_gene_expression_per_cell_type <- as.matrix(mRNA_gene_expression_per_cell_type[mRNAs_in_common, ])
+
+codon_frequency_per_gene_table <- codon_frequency_per_gene_table[ , mRNAs_in_common]
+
+codon_usage_per_cell_type <- codon_frequency_per_gene_table %*% filtered_mRNA_gene_expression_per_cell_type
+
+# largest integers allowed in R is 2147483648, so divide all values by 100 (max value is 21 times larger than limit)
+codon_usage_per_cell_type <- codon_usage_per_cell_type / 100
+codon_usage_per_cell_type <- round(codon_usage_per_cell_type)
+```
+
+# Run DESeq2 analysis
+```{r fig.height = 10, fig.width = 10}
+codon_usage_DESeq2_results <- DESeq2_runner(codon_usage_per_cell_type)
+# Euclidean distance heatmap
+print(codon_usage_DESeq2_results[[1]])
+# PCA results
+print(codon_usage_DESeq2_results[[2]][2])
+print(codon_usage_DESeq2_results[[2]][3])
+# size corrected count matrix
+size_corrected_codon_usage_per_cell_type <- codon_usage_DESeq2_results[[3]]
+```
+
+### Part 3: AA demand analysis (scRNA-seq) ###
+
+# Pool codons to calculate AA demand from mRNAs
+```{r}
+unique_scRNA_seq_cell_types <- colnames(codon_usage_per_cell_type)
+AAs_for_codons <- as.vector(translate(DNAStringSet(sense_codons), no.init.codon = TRUE))
+AA_demand_per_cell_type <- matrix(data = 0, nrow = length(amino_acids), ncol = length(unique_scRNA_seq_cell_types))
+dimnames(AA_demand_per_cell_type) <- list(amino_acids, unique_scRNA_seq_cell_types)
+
+for (i in 1:length(amino_acids)) {
+   AA_demand_per_cell_type[i, ] <- colSums(codon_usage_per_cell_type[which(AAs_for_codons == amino_acids[i]), , drop = FALSE])
+}
+```
+
+# Run DESeq2 analysis
+```{r fig.height = 10, fig.width = 10}
+AA_demand_DESeq2_results <- DESeq2_runner(AA_demand_per_cell_type)
+# Euclidean distance heatmap
+print(AA_demand_DESeq2_results[[1]])
+# PCA results
+print(AA_demand_DESeq2_results[[2]][2])
+print(AA_demand_DESeq2_results[[2]][3])
+# size corrected count matrix
+size_corrected_AA_demand_per_cell_type <- AA_demand_DESeq2_results[[3]]
+```
+
+# Part 4: Examination of codon usage / AA supply outliers
+
+# Create tibble to visualize codon usage and AA demand (normalized as frequencies over total)
+```{r}
+# created tibble with normalized codon usages (frequencies)
+normalized_codon_usage_per_cell_type <- sweep(size_corrected_codon_usage_per_cell_type, 2, colSums(size_corrected_codon_usage_per_cell_type), FUN="/") %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "codon") %>%
+  pivot_longer(., c(-"codon"), names_to = "cell_type", values_to = "usage")
+
+# created tibble with normalized AA demand (frequencies)
+normalized_AA_demand_per_cell_type <- sweep(size_corrected_AA_demand_per_cell_type, 2, colSums(size_corrected_AA_demand_per_cell_type), FUN="/") %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "AA") %>%
+  pivot_longer(., c(-"AA"), names_to = "cell_type", values_to = "usage")
+
+ggplot(data = normalized_codon_usage_per_cell_type, mapping = aes(x = codon, y = usage)) + 
+  theme_classic() + 
+  geom_jitter() +
+  labs(title = "Codon usage across cell types", x = "codon", y = "proportion of total codon usage", color="cell type") +
+  theme(axis.text.x = element_text(angle = 90), 
+        legend.position = "none", 
+        plot.title = element_text(hjust = 0.5, size = 20)) 
+
+ggplot(data = normalized_AA_demand_per_cell_type, mapping = aes(x = AA, y = usage)) + 
+  theme_classic() + 
+  geom_jitter() +
+  labs(title = "AA demand across cell types", x = "AA", y = "proportion of total AA demand", color="cell type") +
+  theme(axis.text.x = element_text(angle = 90), 
+        legend.position = "none", 
+        plot.title = element_text(hjust = 0.5, size = 20))
+```
+# Calculate mean codon usage across all cell types and compare this to the exonic background
+```{r}
+# mean codon usage across cell types
+codon_usage_across_cell_types <- group_by(normalized_codon_usage_per_cell_type, codon) %>%
+  summarise(mean_codon_usage_across_cell_types = mean(usage))
+
+# exonic background: determine codon frequencies across all CDSes
+codon_exonic_background <- rowSums(codon_frequency_per_gene_table) / sum(rowSums(codon_frequency_per_gene_table))
+
+correlation_to_exonic_background <- round(cor(codon_usage_across_cell_types$mean_codon_usage_across_cell_types, codon_exonic_background, method = "spearman"), 3)
+
+codon_usage_across_cell_types$exonic_background_usage <- codon_exonic_background
+
+ggplot(data = codon_usage_across_cell_types, mapping = aes(x = mean_codon_usage_across_cell_types, y = exonic_background_usage, label = codon)) +
+  theme_classic() + 
+  geom_point(size = 3) + 
+  geom_abline(slope = 1, intercept = 0) +
+  xlim(0, 0.05) + ylim(0, 0.05) + 
+  geom_text_repel(max.overlaps = 10) + 
+  labs(title = "Codon frequencies of exonic background \n vs. mean codon usage across cell types", x = "mean codon usage across cell types", y = "codon usage of exonic background") +
+  annotate("text", x = 0.047, y = 0.001, label = sprintf("rho == %f", correlation_to_exonic_background), parse = TRUE)
+```
+
+# Identify outliers: calculate correlation of each cell type's codon usage to the mean codon usage across all cell types
+```{r}
+# calculate each cell types correlation to mean codon usage across cell types
+cell_type_correlations_to_mean_codon_usage <- numeric(length(scRNA_seq_cell_types))
+names(cell_type_correlations_to_mean_codon_usage) <- scRNA_seq_cell_types
+
+for (i in 1:length(scRNA_seq_cell_types)) {
+  # specify cell type
+  select_cell_type_codon_usage <- dplyr::filter(normalized_codon_usage_per_cell_type, cell_type == scRNA_seq_cell_types[i])$usage
+  cell_type_correlations_to_mean_codon_usage[i] <- cor(codon_usage_across_cell_types$mean_codon_usage_across_cell_types, select_cell_type_codon_usage, method = "spearman")
+}
+```
+
+# Calculate each gene's codon pool contribution for each cell type
+```{r}
+codon_pool_contribution_per_gene_per_cell_type <- size_corrected_mRNA_gene_expression_per_cell_type[mRNAs_in_common, ] * colSums(codon_frequency_per_gene_table[, mRNAs_in_common])
+
+# this is a matrix of p protein-coding genes by n cell types, with the values corresponding to the
+# codon pool contribution of each gene (columns sum to 1)
+codon_pool_contribution_per_gene_per_cell_type <- sweep(codon_pool_contribution_per_gene_per_cell_type, 2, colSums(codon_pool_contribution_per_gene_per_cell_type), FUN="/")
+```
+
+# Examine codon pool contribution of top N genes (aka 'codon pool diversity')
+```{r}
+N = 10
+
+codon_pool_contribution_of_top_N_genes <- numeric(length(scRNA_seq_cell_types))
+top_N_codon_pool_contributors_per_cell_type <- matrix(data = 0, nrow = N, ncol = length(scRNA_seq_cell_types))
+
+for (i in 1:length(scRNA_seq_cell_types)) {
+  top_N_genes <- sort(codon_pool_contribution_per_gene_per_cell_type[, i], decreasing = TRUE)[1:N]
+  codon_pool_contribution_of_top_N_genes[i] <- sum(top_N_genes)
+  top_N_codon_pool_contributors_per_cell_type[, i] <- names(top_N_genes)
+}
+
+# Examine correlation between codon pool diversity and correlation to mean codon usage
+codon_pool_diversity_v_correlation_to_mean_codon_usage <- tibble(
+  cell_type = scRNA_seq_cell_types,
+  codon_diversity = 1 - codon_pool_contribution_of_top_N_genes,
+  correlation = cell_type_correlations_to_mean_codon_usage
+) 
+
+correl <- round(cor(codon_pool_diversity_v_correlation_to_mean_codon_usage$codon_diversity,
+              codon_pool_diversity_v_correlation_to_mean_codon_usage$correlation), 3)
+
+ggplot(data = codon_pool_diversity_v_correlation_to_mean_codon_usage, mapping = aes(x = codon_diversity, y = correlation, label = cell_type)) +
+  theme_classic() + 
+  geom_point() +
+  geom_text_repel(max.overlaps = 10, size = 3) + 
+  labs(title = "Cell types' correlation to mean codon usage vs. \n codon pool diversity", x = "codon pool diversity", y = "correlation") +
+  annotate("text", x = 0.95, y = 0.85, label = sprintf("rho == %f", correl), parse = TRUE)
+```
+
+# Calculate correlation with removing top N codon pool contributors
+```{r}
+# remove expression of top N codon pool contributors (so their codon pool contribution becomes 0)
+removed_top_N_genes_size_corrected_mRNA_gene_expression_per_cell_type <- size_corrected_mRNA_gene_expression_per_cell_type[mRNAs_in_common, ]
+
+for (i in 1:length(scRNA_seq_cell_types)) {
+  select_cell_types_top_N_contributors <- top_N_codon_pool_contributors_per_cell_type[, i]
+  removed_top_N_genes_size_corrected_mRNA_gene_expression_per_cell_type[select_cell_types_top_N_contributors, ] <- 0
+}
+
+# recalculate codon usage of each cell type, with top N codon pool contributor genes removed
+removed_top_N_genes_codon_usage_per_cell_type <- codon_frequency_per_gene_table[ , mRNAs_in_common] %*% removed_top_N_genes_size_corrected_mRNA_gene_expression_per_cell_type
+
+removed_top_N_genes_codon_usage_per_cell_type <- sweep(removed_top_N_genes_codon_usage_per_cell_type, 2, colSums(removed_top_N_genes_codon_usage_per_cell_type), "/")
+  
+# calculate correlation to mean codon usage across cell types (from the original codon usage across cell types matrix)
+removed_top_N_genes_correlation_to_mean_codon_usage <- numeric(length(scRNA_seq_cell_types))
+names(removed_top_N_genes_correlation_to_mean_codon_usage) <- scRNA_seq_cell_types
+
+for (i in 1:length(scRNA_seq_cell_types)) {
+  removed_top_N_genes_correlation_to_mean_codon_usage[i] <- cor(removed_top_N_genes_codon_usage_per_cell_type[, i], codon_usage_across_cell_types$mean_codon_usage_across_cell_types)
+} 
+
+# Examine correlation between codon pool diversity and correlation to mean codon usage
+removed_top_N_codon_pool_diversity_v_correlation_to_mean_codon_usage <- tibble(
+  cell_type = scRNA_seq_cell_types,
+  codon_diversity = 1 - codon_pool_contribution_of_top_N_genes,
+  removed_top_N_correlation = removed_top_N_genes_correlation_to_mean_codon_usage
+) 
+
+correl <- round(cor(removed_top_N_codon_pool_diversity_v_correlation_to_mean_codon_usage$codon_diversity,
+              removed_top_N_codon_pool_diversity_v_correlation_to_mean_codon_usage$removed_top_N_correlation), 3)
+
+ggplot(data = removed_top_N_codon_pool_diversity_v_correlation_to_mean_codon_usage, mapping = aes(x = codon_diversity, y = removed_top_N_correlation, label = cell_type)) +
+  theme_classic() + 
+  geom_point() +
+  geom_text_repel(max.overlaps = 10, size = 3) + 
+  labs(title = "Cell types' correlation to mean codon usage vs. \n codon pool diversity (top N contributors removed)", x = "codon pool diversity", y = "correlation") +
+  annotate("text", x = 0.95, y = 0.85, label = sprintf("rho == %f", correl), parse = TRUE) 
+```
+
+### Part 5: tRNA gene expression analysis (scATAC-seq) ###
+
+# Load mm10 tRNA gene information and already processed tRNA gene expression per cell type matrix
+```{r}
+# Load tRNA genomic ranges
+tRNA_granges <- readRDS(paste0(processed_data_directory, "hg19_tRNA_granges.rds"))
+# Load processed tRNA gene usage per cell type matrix
+tRNA_gene_expression_per_cell_type <- readRDS(paste0(processed_data_directory, "FH_filtered_tRNA_gene_expression_by_cell_type.rds"))
+scATAC_seq_cell_types <- colnames(tRNA_gene_expression_per_cell_type)
+```
+
+# Run DESeq2 analysis
+```{r fig.height = 10, fig.width = 10}
+# DESeq2 analysis
+tRNA_gene_expression_DESeq2_results <- DESeq2_runner(tRNA_gene_expression_per_cell_type)
+# Euclidean distance heatmap
+print(tRNA_gene_expression_DESeq2_results[[1]])
+# PCA results
+print(tRNA_gene_expression_DESeq2_results[[2]][2])
+print(tRNA_gene_expression_DESeq2_results[[2]][3])
+# size corrected count matrix
+size_corrected_tRNA_expression_per_cell_type <- tRNA_gene_expression_DESeq2_results[[3]]
+```
+
+# Neurons vs. other cell types differential analysis
+```{r}
+# set fold change threshold to 1 for detection of differentially expressed tRNA genes
+tRNA_gene_level_log2_fc_threshold <- 1
+# set adjusted p-value threshold to 0.05 detection of differentially expressed tRNA genes
+p_value_threshold <- 0.05
+
+# run DESeq2
+neuron_tRNA_gene_level_DE_res <- neuron_DESeq2_runner(tRNA_gene_expression_per_cell_type, tRNA_gene_level_log2_fc_threshold, p_value_threshold)
+print(neuron_tRNA_gene_level_DE_res[[2]] + xlim(-5, 5)) # volcano plot
+```
+
+### Part 6: Anticodon usage analysis (scATAC-seq) ###
+
+# Combine tRNA genes at anticodon isoacceptor level
+```{r}
+# extract anticodons for each tRNA gene
+anticodons_for_tRNA_genes <- sapply(strsplit(rownames(tRNA_gene_expression_per_cell_type), "-"), "[[", 3)
+unique_anticodons <- sort(unique(anticodons_for_tRNA_genes))
+
+anticodon_usage_per_cell_type <- matrix(data = 0, nrow = length(unique_anticodons), ncol = length(scATAC_seq_cell_types))
+dimnames(anticodon_usage_per_cell_type) <- list(unique_anticodons, scATAC_seq_cell_types)
+
+# pool counts from each tRNA gene with a particular anticodon
+for (i in 1:length(unique_anticodons)) {
+  anticodon_usage_per_cell_type[i, ] <- colSums(tRNA_gene_expression_per_cell_type[which(anticodons_for_tRNA_genes == unique_anticodons[i]), , drop = FALSE])
+}
+```
+
+# Heatmap and PCA
+```{r fig.height = 10, fig.width = 10}
+anticodon_expression_DESeq2_results <- DESeq2_runner(anticodon_usage_per_cell_type)
+print(anticodon_expression_DESeq2_results[[1]])
+# PCA results
+print(anticodon_expression_DESeq2_results[[2]][2])
+print(anticodon_expression_DESeq2_results[[2]][3])
+# size corrected count matrix
+size_corrected_anticodon_per_cell_type <- anticodon_expression_DESeq2_results[[3]]
+```
+
+# Neurons vs. other cell types differential analysis
+```{r}
+# set fold change threshold to 0.25 for detection of differentially expressed anticodons
+anticodon_level_log2_fc_threshold <- log2(1.25)
+
+# run DESeq2
+neuron_anticodon_level_DE_res <- neuron_DESeq2_runner(anticodon_usage_per_cell_type, anticodon_level_log2_fc_threshold, p_value_threshold)
+print(neuron_anticodon_level_DE_res[[2]] + xlim(-1, 1)) # volcano plot
+```
+
+### Part 7: Amino acid supply (AA isotype) analysis (scATAC-seq) ###
+
+```{r}
+AA_for_each_anticodon <- as.vector(translate(reverseComplement(DNAStringSet(anticodons_for_tRNA_genes)), no.init.codon = TRUE))
+unique_AA_for_anticodons <- unique(AA_for_each_anticodon)
+
+isotype_usage_per_cell_type <- matrix(data = 0, nrow = length(unique_AA_for_anticodons), ncol = length(scATAC_seq_cell_types))
+
+dimnames(isotype_usage_per_cell_type) <- list(unique_AA_for_anticodons, scATAC_seq_cell_types)
+
+for (i in 1:length(unique_AA_for_anticodons)) {
+   loci_with_AA_isotype_indices <- which(AA_for_each_anticodon == unique_AA_for_anticodons[i])
+   isotype_usage_per_cell_type[i, ] <- colSums(tRNA_gene_expression_per_cell_type[loci_with_AA_isotype_indices, , drop = FALSE])
+}
+```
+
+# Heatmap and PCA
+```{r fig.height = 10, fig.width = 10}
+AA_supply_expression_DESeq2_results <- DESeq2_runner(isotype_usage_per_cell_type)
+print(AA_supply_expression_DESeq2_results[[1]])
+# PCA results
+print(AA_supply_expression_DESeq2_results[[2]][2])
+print(AA_supply_expression_DESeq2_results[[2]][3])
+# size corrected count matrix
+size_corrected_AA_supply_per_cell_type <- AA_supply_expression_DESeq2_results[[3]]
+```
+
+# Neuron differential analysis
+```{r}
+# set fold change threshold to 0.25 for + xlim(-1, 1)detection of differentially expressed AA isotypes
+isotype_level_log2_fc_threshold <- log2(1.25)
+
+# run DESeq2
+neuron_isotype_level_DE_res <- neuron_DESeq2_runner(isotype_usage_per_cell_type, isotype_level_log2_fc_threshold, p_value_threshold)
+print(neuron_isotype_level_DE_res[[2]] + xlim(-1, 1)) # volcano plot
+```
+
+### Part 8: Translation efficiency analysis ###
+
+# Calculate translation efficiency for cell types that are present in both scRNA-seq and scATAC-seq datasets
+```{r}
+cell_types_for_TE_analysis <- intersect(scRNA_seq_cell_types, scATAC_seq_cell_types)
+
+filtered_size_corrected_AA_supply_per_cell_type <- size_corrected_AA_supply_per_cell_type[amino_acids, cell_types_for_TE_analysis]
+
+filtered_size_corrected_AA_demand_per_cell_type <- size_corrected_AA_demand_per_cell_type[amino_acids, cell_types_for_TE_analysis]
+
+TEs_at_AA_level <- numeric(length(cell_types_for_TE_analysis))
+names(TEs_at_AA_level) <- cell_types_for_TE_analysis
+
+for (i in 1:length(cell_types_for_TE_analysis)) {
+  select_cell_type <- cell_types_for_TE_analysis[i]
+  AA_supply_from_tRNA <- filtered_size_corrected_AA_supply_per_cell_type[, select_cell_type]
+  AA_demand_from_mRNA <- filtered_size_corrected_AA_demand_per_cell_type[amino_acids , select_cell_type]
+  TEs_at_AA_level[i] <- cor(AA_supply_from_tRNA, AA_demand_from_mRNA, method = "spearman")
+}
+```
+
+# Determine statistical significance of translation efficiencies 
+This takes about 10 minutes on macOS Catalina version 10.15.17. The results are saved as an R object file (.rds). Therefore, to skip this step, go to the next block which reads in an object after running this block.
+```{r}
+# identify amino acids that each tRNA gene is charged with
+AAs_for_tRNA_genes <- as.vector(translate(reverseComplement(DNAStringSet(anticodons_for_tRNA_genes)), no.init.codon = TRUE))
+
+# vector to store empirical p-value results
+TE_p_values <- numeric(length(cell_types_for_TE_analysis))
+
+# perform the following for all cell types in common between scATAC-seq and scRNA-seq dataset
+for (i in 1:length(cell_types_for_TE_analysis)) {
+  
+  # ATAC-seq cell type
+  select_ATAC_cell_type <- cell_types_for_TE_analysis[i]
+  # corresponding RNA-seq cell type
+  select_RNA_cell_type <- cell_types_for_TE_analysis[i]
+  
+  # number of null distribution samplings
+  N = 1000
+  
+  # observed (true) AA supply usage for this cell type
+  mRNA_AA_usage <- size_corrected_AA_demand_per_cell_type[amino_acids, select_RNA_cell_type]
+  
+  # observed (true) tRNA gene usage for this cell type: this will be shuffled N times to determine statistical significance
+  true_tRNA_usage <- size_corrected_tRNA_expression_per_cell_type[, select_ATAC_cell_type]
+  
+  # vector to store the correlation coefficients, from random shuffling of tRNA counts
+  null_TEs_AA = numeric(N)
+  
+  # perform the shuffles
+  for (j in 1:N) {
+    # sum up the cuts for each tRNA gene across all examples of that cell type, shuffle it using sample()
+    shuffled_tRNA_usage <- sample(true_tRNA_usage)
+    
+    # create a tibble storing this shuffled tRNA gene usage
+    random_tibble <- tibble(
+      sums = shuffled_tRNA_usage,
+      AA = AAs_for_tRNA_genes
+    )
+    
+    # combine shuffled tRNA gene counts at AA level
+    random_tRNA_AA_usage <- summarize(group_by(random_tibble, AA), sums = sum(sums))
+    random_tRNA_AA_usage <- random_tRNA_AA_usage[which(random_tRNA_AA_usage$AA %in% amino_acids), ]
+    random_tRNA_AA_usage <- random_tRNA_AA_usage$sums
+    
+    # calculate TE (correlated between shuffled AA supply and unshuffled AA demand)
+    random_tRNA_AA_usage = random_tRNA_AA_usage / sum(random_tRNA_AA_usage)
+    null_TEs_AA[j] = cor(random_tRNA_AA_usage, mRNA_AA_usage, method = 'spearman')
+  }
+  
+  # fit parameters (mu and sigma for null distribution)
+  null_TEs_AA <- data.frame(null_dist = null_TEs_AA)
+  mean_random_correlations <- mean(null_TEs_AA$null_dist)
+  sd_random_correlations <- sd(null_TEs_AA$null_dist)
+
+  # calculate p-value for the actual TE (stored in the TEs_at_AA_level vector produced in the previous block)
+  TE_p_values[i] <- 1 - pnorm(TEs_at_AA_level[i], mean = mean_random_correlations, sd = sd_random_correlations)
+}
+
+TE_results_tibble <- tibble(
+  cell_type = names(TEs_at_AA_level),
+  TE = TEs_at_AA_level,
+  p_value = TE_p_values,
+  neg_log10_TE_p_value = -log10(TE_p_values)
+  )
+
+saveRDS(TE_results_tibble, paste0(processed_data_directory, "FH_translation_efficiency_results.rds"))
+```
+
+# Load TE results
+Load this block if you don't want to run the above block.
+```{r}
+# load translation efficiency results 
+TE_results_tibble <- readRDS(paste0(processed_data_directory, "FH_translation_efficiency_results.rds"))
+```
+
+# TE values: Mann-Whitney test comparing neurons against other cell types
+```{r}
+# add classification as neuronal or other
+TE_results_tibble$classification <- "other"
+# identify which cell types are brain neurons (cell types have "neuron" or "granule" in their names); exclude ENS neurons
+ENS_neuron_row <- c(grep("ENS neuron", TE_results_tibble$cell_type))
+neuron_rows <- c(grep("neuron", TE_results_tibble$cell_type))
+neuron_rows <- neuron_rows[which(c(grep("neuron", TE_results_tibble$cell_type)) != ENS_neuron_row)]
+
+TE_results_tibble$classification[neuron_rows] <- "neuron"
+
+ggplot(data = TE_results_tibble, mapping = aes(x = classification, y = TE, fill = classification)) + 
+  theme_classic() + 
+  geom_violin() + 
+  geom_jitter(shape = 16, position = position_jitter(0.2), size = 3) + 
+  labs(title = "Translation efficiencies (TE)", x = "cell type classification", y = "TE") + 
+  ylim(0.6, 0.9)
+
+# perform Mann-Whitney test comparing values for neurons vs. other cell types
+print(wilcox.test(filter(TE_results_tibble, classification == "neuron")$TE, filter(TE_results_tibble, classification == "other")$TE))
+```
+
+# -log10(p-values) of TEs: Mann-Whitney test comparing neurons against other cell types
+```{r}
+ggplot(data = TE_results_tibble, mapping = aes(x = classification, y = neg_log10_TE_p_value, fill = classification)) + 
+  theme_classic() + 
+  geom_violin() + 
+  geom_jitter(shape = 16, position = position_jitter(0.2), size = 3) +
+  labs(title = "TE p-values", x = "cell type classification", y = expression(-log[10]~p~value)) + 
+  ylim(1, 7)
+
+# perform Mann-Whitney test comparing values for neurons vs. other cell types
+print(wilcox.test(filter(TE_results_tibble, classification == "neuron")$neg_log10_TE_p_value, filter(TE_results_tibble, classification == "other")$neg_log10_TE_p_value)) 
+```
+
+# Calculate ratio of AA supply to AA demand for each of the 20 classical AAs
+Tests if there is any statistical significant difference in AA supply-demand ratio between neurons and other cell types for each of the 20 AAs
+```{r}
+# convert AA supply and demand counts to frequencies (so sum of AA supply/demand for a cell type adds to 1)
+norm_size_corrected_AA_supply_per_cell_type <- sweep(size_corrected_AA_supply_per_cell_type, 2,  colSums(size_corrected_AA_supply_per_cell_type), "/")
+norm_size_corrected_AA_demand_per_cell_type <- sweep(size_corrected_AA_demand_per_cell_type, 2,  colSums(size_corrected_AA_demand_per_cell_type), "/")
+
+# divide normalized AA supply by normalized AA demand for each cell type available for TE analysis
+AA_supply_versus_demand <- t(norm_size_corrected_AA_supply_per_cell_type[amino_acids, cell_types_for_TE_analysis] / norm_size_corrected_AA_demand_per_cell_type[amino_acids, cell_types_for_TE_analysis])
+```
+
+```{r}
+# change colnames to three letter AA codes
+colnames(AA_supply_versus_demand) <- three_letter_amino_acids
+
+# convert matrix to tibble for ease in plotting
+AA_supply_versus_demand_tibble <- as.data.frame(AA_supply_versus_demand) %>% 
+    rownames_to_column(var = "cell_type") %>%
+    pivot_longer(cols = all_of(three_letter_amino_acids), names_to = "amino_acid", values_to = "supply_over_demand")
+
+# add classification as neuron vs. other
+AA_supply_versus_demand_tibble$classification <- "other"
+AA_supply_versus_demand_tibble$classification[grep("neuron", AA_supply_versus_demand_tibble$cell_type)] <- "neuron"
+AA_supply_versus_demand_tibble$classification[grep("granule", AA_supply_versus_demand_tibble$cell_type)] <- "neuron"
+
+# violin plot
+ggplot(data = AA_supply_versus_demand_tibble, mapping = aes(x = classification, y = supply_over_demand, fill = classification)) + 
+  theme_classic() + 
+  geom_violin() + 
+  geom_jitter(size = 0.5) + 
+  facet_wrap(~ amino_acid, nrow = 5, scales = "free") + 
+  labs(x = "cell type classification", y = "ratio of AA supply over demand") +
+  theme(axis.text.x = element_blank(), strip.background = element_blank())
+
+# Compute Mann-Whitney statistic
+AA_wilcox_tests <- numeric(length(three_letter_amino_acids))
+names(AA_wilcox_tests) <- three_letter_amino_acids
+fc_in_means <- numeric(length(three_letter_amino_acids))
+names(fc_in_means) <- three_letter_amino_acids
+
+for (i in 1:length(three_letter_amino_acids)) {
+  neuron_ratio <- filter(AA_supply_versus_demand_tibble, amino_acid == three_letter_amino_acids[i], classification == "neuron")$supply_over_demand
+  other_ratio <- filter(AA_supply_versus_demand_tibble, amino_acid == three_letter_amino_acids[i], classification == "other")$supply_over_demand
+  AA_wilcox_tests[i] <- unlist(wilcox.test(neuron_ratio, other_ratio)[3]) # extract p-value from Mann-Whitney test
+  fc_in_means[i] <- mean(neuron_ratio) / mean(other_ratio)
+}
+
+# Create barplot of Mann-Whitney p-values for AAs
+AA_wilcox_tests_tibble <- tibble(
+  AA = three_letter_amino_acids,
+  pvals = AA_wilcox_tests,
+  fc_in_means = fc_in_means
+)
+
+ggplot(data = AA_wilcox_tests_tibble, mapping = aes(x = reorder(AA, log10(pvals)), y = -log10(pvals), fill = fc_in_means)) +
+  theme_classic() + 
+  geom_bar(stat = "identity") + 
+  geom_abline(slope = 0, intercept = -log10(0.05)) + 
+  labs(x = "amino acid", y = expression(-log[10]~p~value)) +
+  coord_flip() 
+```
