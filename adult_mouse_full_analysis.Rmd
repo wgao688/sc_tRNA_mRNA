@@ -22,12 +22,14 @@ This script does the following:
 # Load libraries
 ```{r}
 library(Biostrings)
+library(ggplot2)
 library(dendsort)
 library(DESeq2)
 library(ggrepel)
 library(pheatmap)
 library(tidyverse)
 library(viridis)
+'%notin%' <- Negate('%in%')
 # used to rearrange dendrogram in heatmap: https://slowkow.com/notes/pheatmap-tutorial/
 sort_hclust <- function(...) as.hclust(dendsort(as.dendrogram(...)))
 ```
@@ -228,7 +230,6 @@ scRNA_seq_cell_types <- colnames(mRNA_gene_expression_per_cell_type)
 
 mRNA_gene_expression_DESeq2_results <- readRDS(paste0(processed_data_directory, "AM_mRNA_gene_expression_DESeq2_results.rds"))
 
-mRNA_gene_expression_DESeq2_results[[1]]
 size_corrected_mRNA_gene_expression_per_cell_type <- mRNA_gene_expression_DESeq2_results[[3]]
 ```
 
@@ -745,3 +746,249 @@ ggplot(data = AA_wilcox_tests_tibble, mapping = aes(x = reorder(AA, log10(pvals)
   labs(x = "amino acid", y = expression(-log[10]~p~value)) +
   coord_flip() 
 ```
+
+# Additional translation efficiency analysis
+Above, the AA supply and demand were correlated by pooling all anticodons and codons pertaining to a particular amino acid. Here, we divide the six box amino acids (leucine/L, arginine/R, serine/S) into 2 groups based on which anticodons can base pair with each codon. Specifically, NAG anticodons can base pair with CTN codons (referred to as L) and YAA anticodons can base pair with TTR codons (referred to as L2). NCG anticodons can base pair with CGN codons (R), while YCT anticodons can base pair with AGR codons (R2). NGA anticodons can base pair with TCN codons (S) and RCT anticodons can base pair with AGY codons (S2). Note that not all of these base pairings occur in mammals because the anticodon is absent. 
+
+Because of this division, we calculate the correlation of AA supply and demand across 23 rather than 20 groups.
+
+```{r}
+twenty_three_AAs <- c(amino_acids, "L2", "R2", "S2")
+
+# AAs for codons and anticodons
+anticodon_list <- rownames(size_corrected_anticodon_per_cell_type)
+AAs_for_anticodons <- as.vector(translate(reverseComplement(DNAStringSet(rownames(size_corrected_anticodon_per_cell_type))), no.init.codon = TRUE))
+codon_list <- rownames(size_corrected_codon_usage_per_cell_type)
+AAs_for_codons <- as.vector(translate(DNAStringSet(codon_list), no.init.codon = TRUE))
+
+# divide six boxes for anticodons
+AAs_for_anticodons[which(anticodon_list %in% c("TAA", "CAA"))] <- "L2"
+AAs_for_anticodons[which(anticodon_list %in% c("TCT", "CCT"))] <- "R2"
+AAs_for_anticodons[which(anticodon_list %in% c("GCT", "ACT"))] <- "S2"
+
+# divide six boxes for codons
+AAs_for_codons[which(codon_list %in% c("TTA", "TTG"))] <- "L2"
+AAs_for_codons[which(codon_list %in% c("AGA", "AGG"))] <- "R2"
+AAs_for_codons[which(codon_list %in% c("AGT", "AGC"))] <- "S2"
+
+# 23 AA supply matrix
+twenty_three_AA_supply <- matrix(data = NA, nrow = length(twenty_three_AAs), ncol = dim(size_corrected_anticodon_per_cell_type)[2])
+dimnames(twenty_three_AA_supply) <- list(twenty_three_AAs, colnames(size_corrected_anticodon_per_cell_type))
+
+# 23 AA demand matrix
+twenty_three_AA_demand <- matrix(data = NA, nrow = length(twenty_three_AAs), ncol = dim(size_corrected_codon_usage_per_cell_type)[2])
+dimnames(twenty_three_AA_demand) <- list(twenty_three_AAs, colnames(size_corrected_codon_usage_per_cell_type))
+
+# fill in table
+for (i in 1:length(twenty_three_AAs)) {
+  select_AA <- twenty_three_AAs[i]
+  twenty_three_AA_supply[i, ] <- colSums(size_corrected_anticodon_per_cell_type[which(AAs_for_anticodons == select_AA), , drop = FALSE])
+  twenty_three_AA_demand[i, ] <- colSums(size_corrected_codon_usage_per_cell_type[which(AAs_for_codons == select_AA), , drop = FALSE])
+}
+```
+
+# Calculate translation efficiencies for 23-AA set
+```{r}
+twenty_three_TEs_at_AA_level <- numeric(length(cell_types_for_TE_analysis))
+names(twenty_three_TEs_at_AA_level) <- cell_types_for_TE_analysis
+
+for (i in 1:length(corresponding_scRNA_labels)) {
+  AA_supply_from_tRNA <- twenty_three_AA_supply[, cell_types_for_TE_analysis[i]]
+  AA_demand_from_mRNA <- twenty_three_AA_demand[, corresponding_scRNA_labels[i]]
+  twenty_three_TEs_at_AA_level[i] <- cor(AA_supply_from_tRNA, AA_demand_from_mRNA, method = "spearman")
+}
+```
+
+# Determine statistical significance of translation efficiencies 
+This takes about 6 minutes on macOS Catalina version 10.15.17. The results are saved as an R object file (.rds). Therefore, to skip this step, go to the next block which reads in an object after running this block.
+```{r}
+# identify amino acids that each tRNA gene is charged with
+AAs_for_tRNA_genes <- as.vector(translate(reverseComplement(DNAStringSet(anticodons_for_tRNA_genes)), no.init.codon = TRUE))
+
+# add six boxes division
+AAs_for_tRNA_genes[which(anticodons_for_tRNA_genes %in% c("TAA", "CAA"))] <- "L2"
+AAs_for_tRNA_genes[which(anticodons_for_tRNA_genes %in% c("TCT", "CCT"))] <- "R2"
+AAs_for_tRNA_genes[which(anticodons_for_tRNA_genes %in% c("GCT", "ACT"))] <- "S2"
+
+# vector to store empirical p-value results
+TE_p_values <- numeric(length(cell_types_for_TE_analysis))
+
+# perform the following for all cell types in common between scATAC-seq and scRNA-seq dataset
+for (i in 1:length(cell_types_for_TE_analysis)) {
+  
+  # ATAC-seq cell type
+  select_ATAC_cell_type <- cell_types_for_TE_analysis[i]
+  # corresponding RNA-seq cell type
+  select_RNA_cell_type <- corresponding_scRNA_labels[i]
+  
+  # number of null distribution samplings
+  N = 1000
+  
+  # observed (true) AA supply usage for this cell type
+  mRNA_AA_usage <- twenty_three_AA_demand[amino_acids, select_RNA_cell_type]
+  
+  # observed (true) tRNA gene usage for this cell type: this will be shuffled N times to determine statistical significance
+  true_tRNA_usage <- size_corrected_tRNA_expression_per_cell_type[, select_ATAC_cell_type]
+  
+  # vector to store the correlation coefficients, from random shuffling of tRNA counts
+  null_TEs_AA = numeric(N)
+  
+  # perform the shuffles
+  for (j in 1:N) {
+    # sum up the cuts for each tRNA gene across all examples of that cell type, shuffle it using sample()
+    shuffled_tRNA_usage <- sample(true_tRNA_usage)
+    
+    # create a tibble storing this shuffled tRNA gene usage
+    random_tibble <- tibble(
+      sums = shuffled_tRNA_usage,
+      AA = AAs_for_tRNA_genes
+    )
+    
+    random_tibble$AA[which(anticodons_for_tRNA_genes %in% c("TAA", "CAA"))] <- "L2"
+    random_tibble$AA[which(anticodons_for_tRNA_genes %in% c("TCT", "CCT"))] <- "R2"
+    random_tibble$AA[which(anticodons_for_tRNA_genes %in% c("GCT", "ACT"))] <- "S2"
+    
+    # combine shuffled tRNA gene counts at AA level
+    random_tRNA_AA_usage <- summarize(group_by(random_tibble, AA), sums = sum(sums))
+    random_tRNA_AA_usage <- random_tRNA_AA_usage[which(random_tRNA_AA_usage$AA %in% amino_acids), ]
+    random_tRNA_AA_usage <- random_tRNA_AA_usage$sums
+    
+    # calculate TE (correlated between shuffled AA supply and unshuffled AA demand)
+    random_tRNA_AA_usage = random_tRNA_AA_usage / sum(random_tRNA_AA_usage)
+    null_TEs_AA[j] = cor(random_tRNA_AA_usage, mRNA_AA_usage, method = 'spearman')
+  }
+  
+  # fit parameters (mu and sigma for null distribution)
+  null_TEs_AA <- data.frame(null_dist = null_TEs_AA)
+  mean_random_correlations <- mean(null_TEs_AA$null_dist)
+  sd_random_correlations <- sd(null_TEs_AA$null_dist)
+
+  # calculate p-value for the actual TE (stored in the twenty_three_TEs_at_AA_level vector produced in the previous block)
+  TE_p_values[i] <- 1 - pnorm(twenty_three_TEs_at_AA_level[i], mean = mean_random_correlations, sd = sd_random_correlations)
+}
+
+twenty_three_TE_results_tibble <- tibble(
+  cell_type = names(twenty_three_TEs_at_AA_level),
+  TE = twenty_three_TEs_at_AA_level,
+  p_value = TE_p_values,
+  neg_log10_TE_p_value = -log10(TE_p_values)
+  )
+
+saveRDS(twenty_three_TE_results_tibble, paste0(processed_data_directory, "AM_23_translation_efficiency_results.rds"))
+```
+
+# Load TE results
+Load this block if you don't want to run the above block.
+```{r}
+# load translation efficiency results 
+twenty_three_TE_results_tibble <- readRDS(paste0(processed_data_directory, "AM_23_translation_efficiency_results.rds"))
+```
+
+# TE values: Mann-Whitney test comparing neurons against other cell types
+```{r}
+# add classification as neuronal or other
+twenty_three_TE_results_tibble$classification <- "other"
+# identify which cell types are neurons (cell types have "neuron" or "granule" in their names)
+neuron_rows <- c(grep("neuron", twenty_three_TE_results_tibble$cell_type), grep("granule", twenty_three_TE_results_tibble$cell_type))
+twenty_three_TE_results_tibble$classification[neuron_rows] <- "neuron"
+
+ggplot(data = twenty_three_TE_results_tibble, mapping = aes(x = classification, y = TE, fill = classification)) + 
+  theme_classic() + 
+  geom_violin() + 
+  geom_jitter(shape = 16, position = position_jitter(0.2), size = 3) +
+  labs(title = "Translation efficiencies (TE)", x = "cell type classification", y = "TE") + 
+  ylim(0.6, 0.9)
+
+# perform Mann-Whitney test comparing values for neurons vs. other cell types
+print(wilcox.test(filter(twenty_three_TE_results_tibble, classification == "neuron")$TE, filter(twenty_three_TE_results_tibble, classification == "other")$TE))
+
+ggsave("/Volumes/Samsung_USB/Fulbright/reviewer_stuff/AM_23_TEs.pdf", height = 6, width = 6)
+```
+
+# -log10(p-values) of TEs: Mann-Whitney test comparing neurons against other cell types
+```{r}
+ggplot(data = twenty_three_TE_results_tibble, mapping = aes(x = classification, y = neg_log10_TE_p_value, fill = classification)) + 
+  theme_classic() + 
+  geom_violin() + 
+  geom_jitter(shape = 16, position = position_jitter(0.2), size = 3) +
+  labs(title = "TE p-values", x = "cell type classification", y = expression(-log[10]~p~value)) + 
+  ylim(1, 7)
+
+# perform Mann-Whitney test comparing values for neurons vs. other cell types
+print(wilcox.test(filter(twenty_three_TE_results_tibble, classification == "neuron")$neg_log10_TE_p_value, filter(twenty_three_TE_results_tibble, classification == "other")$neg_log10_TE_p_value)) 
+
+ggsave("/Volumes/Samsung_USB/Fulbright/reviewer_stuff/AM_23_TE_p_values.pdf", height = 6, width = 6)
+```
+
+# Calculate ratio of AA supply to AA demand for each of the 20 classical AAs
+Tests if there is any statistical significant difference in AA supply-demand ratio between neurons and other cell types for each of the 20 AAs
+```{r}
+# convert AA supply and demand counts to frequencies (so sum of AA supply/demand for a cell type adds to 1)
+twenty_three_AA_supply_per_cell_type <- sweep(twenty_three_AA_supply, 2,  colSums(twenty_three_AA_supply), "/")
+twenty_three_AA_demand_per_cell_type <- sweep(twenty_three_AA_demand, 2,  colSums(twenty_three_AA_demand), "/")
+
+# divide normalized AA supply by normalized AA demand for each cell type available for TE analysis
+twenty_three_AA_supply_versus_demand <- t(twenty_three_AA_supply_per_cell_type[twenty_three_AAs, cell_types_for_TE_analysis] / twenty_three_AA_demand_per_cell_type[twenty_three_AAs, corresponding_scRNA_labels])
+```
+
+```{r}
+# change colnames to three letter AA codes
+three_letter_amino_acids_plus_divisions <- c(three_letter_amino_acids, "Arg-2", "Leu-2", "Ser-2")
+colnames(twenty_three_AA_supply_versus_demand) <- three_letter_amino_acids_plus_divisions
+
+# convert matrix to tibble for ease in plotting
+twenty_three_AA_supply_versus_demand_tibble <- as.data.frame(twenty_three_AA_supply_versus_demand) %>% 
+    rownames_to_column(var = "cell_type") %>%
+    pivot_longer(cols = all_of(three_letter_amino_acids_plus_divisions), names_to = "amino_acid", values_to = "supply_over_demand")
+
+# add classification as neuron vs. other
+twenty_three_AA_supply_versus_demand_tibble$classification <- "other"
+twenty_three_AA_supply_versus_demand_tibble$classification[grep("neuron", twenty_three_AA_supply_versus_demand_tibble$cell_type)] <- "neuron"
+twenty_three_AA_supply_versus_demand_tibble$classification[grep("granule", twenty_three_AA_supply_versus_demand_tibble$cell_type)] <- "neuron"
+
+# violin plot
+ggplot(data = twenty_three_AA_supply_versus_demand_tibble, mapping = aes(x = classification, y = supply_over_demand, fill = classification)) + 
+  theme_classic() + 
+  geom_violin() + 
+  geom_jitter(size = 0.5) + 
+  facet_wrap(~ amino_acid, nrow = 5, scales = "free") +  
+  labs(x = "cell type classification", y = "ratio of AA supply over demand") + 
+  theme(axis.text.x = element_blank(), strip.background = element_blank())
+
+ggsave("/Volumes/Samsung_USB/Fulbright/reviewer_stuff/AM_23_AA_SD_ratio_violins.pdf", height = 6, width = 6)
+
+# Compute Mann-Whitney statistic
+AA_wilcox_tests <- numeric(length(three_letter_amino_acids_plus_divisions))
+names(AA_wilcox_tests) <- three_letter_amino_acids_plus_divisions
+fc_in_means <- numeric(length(three_letter_amino_acids_plus_divisions))
+names(fc_in_means) <- three_letter_amino_acids_plus_divisions
+
+for (i in 1:length(three_letter_amino_acids_plus_divisions)) {
+  neuron_ratio <- filter(twenty_three_AA_supply_versus_demand_tibble, amino_acid == three_letter_amino_acids_plus_divisions[i], classification == "neuron")$supply_over_demand
+  other_ratio <- filter(twenty_three_AA_supply_versus_demand_tibble, amino_acid == three_letter_amino_acids_plus_divisions[i], classification == "other")$supply_over_demand
+  AA_wilcox_tests[i] <- unlist(wilcox.test(neuron_ratio, other_ratio)[3]) # extract p-value from Mann-Whitney test
+  fc_in_means[i] <- mean(neuron_ratio) / mean(other_ratio)
+}
+
+# Create barplot of Mann-Whitney p-values for AAs
+AA_wilcox_tests_tibble <- tibble(
+  AA = three_letter_amino_acids_plus_divisions,
+  pvals = AA_wilcox_tests,
+  fc_in_means = fc_in_means
+)
+
+ggplot(data = AA_wilcox_tests_tibble, mapping = aes(x = reorder(AA, log10(pvals)), y = -log10(pvals), fill = fc_in_means)) +
+  theme_classic() + 
+  geom_bar(stat = "identity") + 
+  geom_abline(slope = 0, intercept = -log10(0.05)) + 
+  labs(x = "amino acid", y = expression(-log[10]~p~value)) +
+  coord_flip() 
+
+ggsave("/Volumes/Samsung_USB/Fulbright/reviewer_stuff/AM_23_AA_SD_ratio_barplot.pdf", height = 6, width = 6)
+```
+
+
+
+
+
+
