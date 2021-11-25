@@ -1,4 +1,4 @@
-<img src="https://img.shields.io/badge/Language-Perl-blue.svg" style="zoom:100%;" /> <img src="https://visitor-badge.glitch.me/badge?page_id=wgao688.sc_tRNA_mRNA&right_color=red&left_text=Total%20Visits" alt="visitor badge"/>
+<img src="https://img.shields.io/badge/Language-R-blue.svg" style="zoom:100%;" /> <img src="https://visitor-badge.glitch.me/badge?page_id=wgao688.sc_tRNA_mRNA&right_color=red&left_text=Total%20Visits" alt="visitor badge"/>
 
 # Single-cell Translation Efficiency Resource
 
